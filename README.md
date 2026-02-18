@@ -1,89 +1,200 @@
 # Gemini API Key Rotator Proxy Server
 
-This project is a FastAPI-based local proxy server designed for the Google Gemini API to using in Roo Code (Cline, Cursor, Windsurf, LibreChat, Continue, opencode).
-It provides Gemini API key rotation, which helps distribute the load and bypass rate limits. This is particularly useful if you have multiple Free Tier Gemini keys and want to combine their rate limits.
+A FastAPI/Uvicorn reverse proxy for the Google Gemini API that manages a pool of API keys with automatic rotation, rate-limit handling, and operational tooling. Designed for use with Roo Code, Cline, Cursor, Windsurf, LibreChat, Continue, and any other tool that speaks the Gemini REST API.
 
-The server offers two modes of operation:
-1.  `main.py`: A native proxy that directly forwards requests to the Gemini API, automatically detecting the authentication type (API key or OAuth token).
-2.  `main-openai.py`: An OpenAI API-compatible proxy. It accepts requests in the OpenAI format and adapts them for the Gemini API, allowing you to use existing tools and libraries developed for OpenAI.
+## Features
 
-## Key Features
-
--   **API Key Rotation**: Automatically cycles through a list of keys for each request.
--   **Proxy Support**: Option to route all outgoing traffic through a specified HTTP/SOCKS4/SOCKS5 proxy (e.g. local sing-box or some stuff from public proxy lists).
--   **Backoff Mechanism**: If a key fails (e.g., due to rate limiting), it is temporarily disabled with an exponentially increasing delay.
--   **Dual-Mode Operation**: Native and OpenAI-compatible modes.
--   **Streaming Support**: Correctly handles and forwards streaming responses from the API.
--   **Admin Endpoints**: Allows viewing the status of keys and reloading them without restarting the server.
+- **API Key Rotation** — Least-usage-first load balancing across a pool of keys. Proactively rotates after `MAX_REQ_PER_KEY` requests per key.
+- **Rate-Limit Handling** — 429 responses trigger a 60-second per-key cooldown; other failures use a 5-second backoff. The proxy retries with the next available key transparently.
+- **Streaming Support** — Correctly proxies SSE streaming responses (`alt=sse`, `:streamGenerateContent`) using a shared long-lived `httpx.AsyncClient`.
+- **Live Metrics** — In-process counters for total requests, success/fail, 429 events, key rotations, and a 100-event benching history.
+- **Web Dashboard** — Live key pool status table, metrics summary bar, and SSE log tail at `/dashboard`.
+- **HTTP Status Endpoints** — `/health` (200/503), `/status` (JSON), `/pool-status` (dashboard feed), `/reload-keys` (POST hot-reload).
+- **Telegram Bot** — 8 commands (`/help`, `/status`, `/rotate`, `/ban`, `/unban`, `/uptime`, `/config`, `/digest`) + inline keyboard buttons + proactive per-key failure and pool health alerts.
+- **macOS `launchd` Service** — Runs as `com.antigravity.proxy`, auto-starts on login, restarts on crash, with `newsyslog` log rotation.
+- **`.env` Support** — Loads secrets from a `.env` file at startup via `python-dotenv` (soft dependency).
 
 ## Requirements
 
--   Python 3.7+
--   `fastapi`
--   `uvicorn`
--   `httpx`
+- Python 3.9+
+- `fastapi`
+- `uvicorn`
+- `httpx`
+- `python-dotenv` *(optional — for `.env` file support)*
 
-## Installation
+## Quick Start
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/jwadow/gemini-api-key-rotator-proxy-server.git
-    cd gemini-api-key-rotator-proxy-server
-    ```
+```sh
+# 1. Clone
+git clone https://github.com/s-a-c/gemini-api-key-rotator-proxy-server.git
+cd gemini-api-key-rotator-proxy-server
 
-2.  Install the dependencies:
-    ```bash
-    pip install fastapi uvicorn httpx
-    ```
+# 2. Install dependencies
+pip install fastapi uvicorn httpx python-dotenv
+# or with uv:
+uv sync
+
+# 3. Add your Gemini API keys (one per line)
+echo "AIzaSy...key1" >> api_keys.txt
+echo "AIzaSy...key2" >> api_keys.txt
+
+# 4. (Optional) Configure secrets
+cp .env.example .env
+# edit .env with your TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, ADMIN_TOKEN
+
+# 5. Run
+uv run uvicorn main:APP --host 0.0.0.0 --port 8888
+```
 
 ## Configuration
 
-1.  Create a file named `api_keys.txt` in the project's root directory.
-2.  Add your Google Gemini API keys to this file, one per line.
+### `api_keys.txt`
 
-    ```
-    AIzaSy...key1
-    AIzaSy...key2
-    AIzaSy...key3
-    ```
+One key per line. Both API key format (`AIzaSy...`) and OAuth Bearer tokens are supported — the proxy detects the format automatically.
 
-3.  (Optional) Configure the settings in `main.py` or `main-openai.py`:
-    -   `VPN_PROXY_URL`: The URL of your HTTP proxy (e.g., `"192.168.1.103:2080"` or leave empty).
-    -   `ADMIN_TOKEN`: A token for accessing the admin endpoints. It is recommended to change the default value.
-
-## Running the Server
-
-You can run the server in one of two modes.
-
-### Native Mode
-
-This mode directly proxies requests to the Gemini API.
-
-```bash
-uvicorn main:APP --host 127.0.0.1 --port 8000
+```
+AIzaSy...key1
+AIzaSy...key2
+AIzaSy...key3
 ```
 
-### OpenAI-Compatible Mode (it has bugs!)
+### Environment Variables
 
-This mode allows you to use clients compatible with the OpenAI API.
+| Variable | Default | Description |
+|---|---|---|
+| `TELEGRAM_TOKEN` | `""` | Telegram Bot API token from [@BotFather](https://t.me/BotFather). Leave empty to disable Telegram entirely. |
+| `TELEGRAM_CHAT_ID` | `""` | Your numeric Telegram chat ID (get it from [@userinfobot](https://t.me/userinfobot)). |
+| `ADMIN_TOKEN` | `changeme_local_only` | Bearer token for accessing internal endpoints from non-localhost clients. |
 
-```bash
-uvicorn main-openai:APP --host 127.0.0.1 --port 8000
+Set these in any of three ways (highest priority wins):
+
+1. **Shell environment** — `export TELEGRAM_TOKEN=...`
+2. **launchd plist** `EnvironmentVariables` dict
+3. **`.env` file** — copy `.env.example` to `.env` and fill in values
+
+### Key Tuning (`main.py`)
+
+| Constant | Default | Effect |
+|---|---|---|
+| `MAX_REQ_PER_KEY` | `15` | Proactive rotation threshold |
+| `COOLDOWN_PERIOD` | `60s` | Per-key cooldown after a 429 |
+| `BACKOFF_MIN` | `5s` | Per-key cooldown after other failures |
+
+## HTTP Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/{path}` | `GET/POST/…` | Proxy to `https://generativelanguage.googleapis.com/v1beta/{path}` |
+| `/health` | GET | `200 {"status":"ok"}` / `503 {"status":"degraded"}` |
+| `/status` | GET | JSON pool snapshot + full metrics |
+| `/pool-status` | GET | Lightweight JSON for dashboard polling |
+| `/reload-keys` | POST | Hot-reload `api_keys.txt` without restarting |
+| `/dashboard` | GET | Web dashboard (key table + metrics bar + live log tail) |
+| `/logs` | GET | Raw SSE stream of `logs/proxy.log` |
+| `HEAD /*` | HEAD | Always `200` — for basic uptime monitors |
+
+**Auth:** Requests from `127.0.0.1`/`::1` are always allowed. Remote requests to internal endpoints require `Authorization: Bearer <ADMIN_TOKEN>`.
+
+### Path Normalisation
+
+The proxy accepts any of these equivalent forms and forwards them identically:
+
+```sh
+curl http://127.0.0.1:8888/v1beta/models          # explicit v1beta prefix
+curl http://127.0.0.1:8888/v1/models               # v1 prefix
+curl http://127.0.0.1:8888/models                  # bare path
 ```
 
-## Example Usage
+## Telegram Bot Commands
 
-### With `openai` Python library
-The `test-openai.py` file demonstrates how to use the proxy with the `openai` Python library.
+| Command | Description |
+|---|---|
+| `/help` | List all commands |
+| `/status` | Key pool status with inline action buttons |
+| `/rotate` | Reset all usage counters and cooldowns |
+| `/ban <key> [seconds]` | Bench a key for a given duration (default 24h) |
+| `/unban` | Clear all active cooldowns |
+| `/uptime` | Uptime, request counts, success rate |
+| `/config` | Current runtime configuration values |
+| `/digest` | Full health summary with recent benching events |
 
-### With Roo Code
+Inline buttons on the `/status` response: **🔄 Reload Keys** · **🔃 Rotate All** · **✅ Unban All**
 
-**For `main.py` (Native Mode):**
-- Create a new API provider: "Google Gemini".
-- Enable "Use custom base URL" and set it to `http://127.0.0.1:8000`.
+### Proactive Alerts
 
-**For `main-openai.py` (OpenAI-Compatible Mode):**
-- Create a new API provider: "OpenAI Compatible".
-- Set the Base URL to `http://127.0.0.1:8000`.
-- Use any value for the API key (e.g., `changeme_local_only`).
-- Specify the desired model, for example `gemini-2.5-pro`.
+| Alert | Trigger |
+|---|---|
+| 🔴 Key benched (rate limit) | Key receives HTTP 429 |
+| ❌ Key benched (auth error) | Key receives HTTP 401/403 |
+| ⚠️ Key benched (other) | Any other upstream failure |
+| ⚠️ Pool degraded | >50% of keys simultaneously benched |
+| 🚨 All keys exhausted | Pool has no available keys |
+
+Global cap: 5 notifications per minute. Per-key cooldown: 5 minutes.
+
+## macOS `launchd` Service
+
+See **[`docs/launchd-service-guide.md`](docs/launchd-service-guide.md)** for the complete installation and operations guide. Quick reference:
+
+```sh
+# Install
+cp service/LaunchAgents/com.antigravity.proxy.plist ~/Library/LaunchAgents/
+# Edit WorkingDirectory and EnvironmentVariables in the plist, then:
+launchctl load ~/Library/LaunchAgents/com.antigravity.proxy.plist
+
+# Status
+launchctl list | grep antigravity
+
+# Reload keys (no restart needed)
+curl -X POST http://127.0.0.1:8888/reload-keys
+
+# Health check
+curl http://127.0.0.1:8888/health
+
+# Unload
+launchctl unload ~/Library/LaunchAgents/com.antigravity.proxy.plist
+```
+
+Log rotation is provided by `service/etc/newsyslog.d/com.antigravity.proxy.conf` — install to `/etc/newsyslog.d/` to rotate `~/Library/Logs/com.antigravity.proxy.*` automatically.
+
+## Use with Roo Code / Cline / Cursor
+
+**Native Gemini mode (`main.py`):**
+
+- Provider: **Google Gemini**
+- Base URL: `http://127.0.0.1:8888`
+- API key: *(leave blank — the proxy injects keys from `api_keys.txt`)*
+
+**OpenAI-compatible mode (`main-openai.py`):**
+
+- Provider: **OpenAI Compatible**
+- Base URL: `http://127.0.0.1:8888`
+- API key: `changeme_local_only`
+- Model: e.g. `gemini-2.5-pro`
+
+## Project Structure
+
+```
+.
+├── main.py                          # Proxy app (native Gemini mode)
+├── main-openai.py                   # Proxy app (OpenAI-compatible mode)
+├── api_keys.txt                     # Your API keys (gitignored)
+├── .env.example                     # Environment variable template
+├── requirements.txt                 # Python dependencies
+├── logs/
+│   └── proxy.log                    # Rotating application log
+├── service/
+│   ├── LaunchAgents/
+│   │   └── com.antigravity.proxy.plist      # launchd service definition
+│   └── etc/
+│       └── newsyslog.d/
+│           └── com.antigravity.proxy.conf   # Log rotation config
+└── docs/
+    ├── launchd-service-guide.md     # Full service documentation
+    └── plans/
+        └── 010-proxy-enhancements-implementation-plan.md
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -365,6 +365,7 @@ crashes automatically.
 |---|---|---|---|
 | `TELEGRAM_TOKEN` | No | `""` (empty) | Telegram Bot API token from [@BotFather](https://t.me/BotFather). Format: `123456789:AABBccdd...` |
 | `TELEGRAM_CHAT_ID` | No | `""` (empty) | Your numeric Telegram chat ID. Get it by messaging [@userinfobot](https://t.me/userinfobot). |
+| `ADMIN_TOKEN` | No | `changeme_local_only` | Bearer token required to access internal endpoints (`/status`, `/health`, etc.) from non-localhost clients. See [Security Considerations](#security-considerations). |
 
 **Telegram is entirely optional.** If either variable is empty or unset, the
 proxy disables all Telegram functionality silently and logs:
@@ -374,9 +375,44 @@ Telegram integration disabled (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set)
 
 ```
 
-To add more environment variables (e.g., `DEBUG`, `PYTHONUNBUFFERED`), add
-additional `<key>/<string>` pairs inside the `EnvironmentVariables` dict in the
-plist.
+### Setting Variables — Three Options
+
+**Option 1 — launchd plist `EnvironmentVariables` (recommended for the service):**
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+    <key>TELEGRAM_TOKEN</key>
+    <string>123456789:AABBccdd...</string>
+    <key>TELEGRAM_CHAT_ID</key>
+    <string>987654321</string>
+    <key>ADMIN_TOKEN</key>
+    <string>my-secret-token</string>
+</dict>
+```
+
+**Option 2 — `.env` file (recommended for local development):**
+
+Copy `.env.example` to `.env` in the project root and fill in your values:
+
+```sh
+cp .env.example .env
+# edit .env with your values
+```
+
+The proxy loads `.env` automatically at startup via `python-dotenv` (soft
+dependency — falls back to system environment if not installed). The `.env`
+file is listed in `.gitignore` and must never be committed.
+
+**Option 3 — Shell environment (for manual `uv run` invocations):**
+
+```sh
+export TELEGRAM_TOKEN="123456789:AABBccdd..."
+export TELEGRAM_CHAT_ID="987654321"
+uv run uvicorn main:APP --host 0.0.0.0 --port 8888
+```
+
+**Priority order (highest wins):** shell environment → launchd plist → `.env` file.
 
 ---
 
@@ -498,23 +534,52 @@ sudo newsyslog -v
 
 ### Bot Commands
 
-| Command / Action | What it Does |
+| Command | What it Does |
 |---|---|
-| `/status` | Returns a status report showing each key's preview, usage count, and availability |
-| `🔄 Reload Keys` (inline button) | Hot-reloads `api_keys.txt` without restarting the proxy, then sends an updated status report |
+| `/help` | List all available commands with brief descriptions |
+| `/status` | Key pool status — each key's preview, usage, success/fail counts, and cooldown state, with inline action buttons |
+| `/rotate` | Reset all usage counters and cooldowns (soft reset — no file reload) |
+| `/ban <key> [seconds]` | Manually bench a key for the given duration (default 86400s = 24h). Example: `/ban AIzaSyCDpw 3600` |
+| `/unban` | Clear all active cooldowns immediately, making every key available |
+| `/uptime` | Proxy uptime, total requests, success rate, 429 count, rotation count, keys available |
+| `/config` | Show current runtime configuration values (key count, timeouts, thresholds) |
+| `/digest` | Full on-demand health summary: uptime, request stats, key pool state, and the 5 most recent benching events |
+
+**Inline keyboard buttons** (shown below the `/status` response):
+
+| Button | What it Does |
+|---|---|
+| `🔄 Reload Keys` | Hot-reloads `api_keys.txt` from disk, then shows updated status |
+| `🔃 Rotate All` | Equivalent to `/rotate` — resets all counters and cooldowns |
+| `✅ Unban All` | Equivalent to `/unban` — clears all active cooldowns |
+
+### Proactive Notifications
+
+The bot sends unsolicited alerts when notable events occur:
+
+| Alert | Trigger | Cooldown |
+|---|---|---|
+| 🔴 Key benched (rate limit) | A key receives HTTP 429 from Google | 5 min per key |
+| ❌ Key benched (auth error) | A key receives HTTP 401 or 403 | 10 min per key |
+| ⚠️ Key benched (other error) | Any other upstream failure (5xx, timeout) | 5 min per key |
+| ⚠️ Pool degraded | More than half the keys are simultaneously benched | 5 min global |
+| 🚨 All keys exhausted | The pool has no available keys at all | 5 min global |
+
+**Storm protection:** A global cap of 5 notifications per minute prevents alert
+floods when Google is down and all keys fail simultaneously.
 
 ### Resilience Features
 
-The Telegram listener was significantly hardened in this version:
-
 | Feature | Details |
 |---|---|
-| **Correct HTTP timeout** | The `httpx.AsyncClient` uses `timeout=30` seconds, exceeding the Telegram long-poll timeout of 20 seconds. The original code used the httpx default of 5 seconds, causing `ReadTimeout` errors every 5 seconds. |
-| **Exponential backoff** | On error, waits 5s → 10s → 20s → 40s → … → 300s (5 min cap) before retrying. Resets to 5s on success. |
-| **Descriptive errors** | Uses `repr(e)` instead of `str(e)` so error types are always visible (e.g., `ReadTimeout('')` instead of blank). |
-| **API response validation** | Checks `data["ok"]` from Telegram before processing. Invalid tokens now produce clear `RuntimeError: Telegram API error: Unauthorized` messages. |
-| **Graceful degradation** | `send_alert()` wraps its HTTP call in try/except and logs failures as warnings, never crashing the main proxy. |
-| **Rate-limited alerts** | At most one alert per 10 minutes to avoid Telegram spam. |
+| **Shared httpx client** | A single `AsyncClient` is created at startup and lives for the app lifetime. The TG listener reuses it, avoiding per-poll TLS handshakes. |
+| **Correct HTTP timeout** | Long-poll uses `timeout=30s` (exceeds Telegram's 20s long-poll window). |
+| **Exponential backoff** | On error, waits 5s → 10s → 20s → … → 300s (5 min cap) before retrying. Resets to 5s on success. |
+| **Descriptive errors** | Uses `repr(e)` so error types are always visible in logs. |
+| **API response validation** | Checks `data["ok"]` before processing updates. Invalid tokens produce clear error messages. |
+| **Graceful degradation** | `send_alert()` and all command handlers catch exceptions internally; failures never crash the main proxy. |
+| **Per-topic rate limiting** | Each alert topic (per key, pool health, exhausted) has its own independent cooldown. One topic firing doesn't suppress others. |
+| **Graceful shutdown** | On `SIGTERM`, the TG listener task is cancelled cleanly before the process exits. |
 
 ### Disabling Telegram
 
@@ -562,11 +627,35 @@ dummy key like `proxy-managed-session`.
 
 ### Internal Endpoints
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/dashboard` | GET | Live web dashboard — tails `logs/proxy.log` via SSE in a dark-themed terminal UI |
-| `/logs` | GET | Raw SSE stream of log lines (used by the dashboard's `EventSource`) |
-| `HEAD /*` | HEAD | Always returns `200 OK` — designed for health checks and uptime monitors |
+| Endpoint | Method | Auth Required* | Description |
+|---|---|---|---|
+| `/dashboard` | GET | Remote only | Live web dashboard — key pool table, metrics bar, and SSE log tail |
+| `/logs` | GET | Remote only | Raw SSE stream of `logs/proxy.log` lines (used by the dashboard) |
+| `/status` | GET | Remote only | JSON snapshot of pool status + full metrics |
+| `/pool-status` | GET | Remote only | Lightweight JSON polled by the dashboard every 3 seconds |
+| `/health` | GET | Remote only | `200 ok` when ≥1 key is available; `503 degraded` when all keys are benched |
+| `/reload-keys` | POST | Remote only | Hot-reload `api_keys.txt` from disk without restarting the service |
+| `HEAD /*` | HEAD | No | Always returns `200 OK` — for uptime monitors that can't use `/health` |
+
+\* **Auth:** Requests from `127.0.0.1` or `::1` are always allowed without
+authentication. Requests from any other IP must include:
+
+```sh
+Authorization: Bearer <ADMIN_TOKEN>
+```
+
+The default `ADMIN_TOKEN` is `changeme_local_only`. Change it via the
+`ADMIN_TOKEN` environment variable before exposing the service on the network.
+
+**Example — machine on the same LAN:**
+
+```sh
+# No token needed from localhost:
+curl http://127.0.0.1:8888/status
+
+# Token required from any other address:
+curl -H "Authorization: Bearer my-secret-token" http://192.168.1.10:8888/status
+```
 
 ### Key Rotation Logic
 
@@ -606,7 +695,7 @@ returning `502 Bad Gateway`.
 Streaming is detected when:
 
 - `alt=sse` is in the query string, **or**
-- `:generateContent` is in the URL path
+- `:streamGenerateContent` is in the URL path
 
 Streamed responses use `StreamingResponse` with `media_type="text/event-stream"`,
 forwarding chunks as they arrive from Google with no buffering.
@@ -657,16 +746,26 @@ Key fields in the output:
 ### Health Check
 
 ```sh
-# Quick check — returns HTTP status code
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
+# Structured health check — returns JSON + HTTP status code
+# 200 {"status":"ok",...}    when ≥1 key is available
+# 503 {"status":"degraded"} when all keys are benched
+curl -s -w "\nHTTP %{http_code}\n" http://127.0.0.1:8888/health
 
-# HEAD request (always 200 if service is up)
+# Quick connectivity probe (HEAD — always 200 if the process is up)
 curl -I http://127.0.0.1:8888/
+
+# Full JSON status snapshot (pool + metrics)
+curl -s http://127.0.0.1:8888/status | python3 -m json.tool
 
 # Dashboard (browser)
 open http://127.0.0.1:8888/dashboard
 
 ```
+
+Use `/health` for monitoring tools (e.g. UptimeRobot, Pingdom, launchd
+`HealthCheck`). It returns `503` when the proxy cannot service requests, which
+`HEAD /` cannot distinguish.
+
 
 ### View Logs
 
@@ -711,19 +810,27 @@ open http://127.0.0.1:8888/dashboard
 
 ### Reload API Keys Without Restarting
 
-There are two ways to hot-reload `api_keys.txt`:
+There are three ways to hot-reload `api_keys.txt` without downtime:
 
-1. **Via Telegram** — Send `/status` to your bot, then tap the `🔄 Reload Keys`
-   inline button.
+1. **Via HTTP POST** (fastest — no Telegram required):
 
-2. **Restart the service** — The key file is read at startup:
+   ```sh
+   curl -X POST http://127.0.0.1:8888/reload-keys
+   # → {"status": "ok", "keys_loaded": 5}
+   ```
+
+2. **Via Telegram** — Send `/status` to your bot, then tap the `🔄 Reload Keys`
+   inline button. Or send the `/rotate` command to clear all usage counters and
+   cooldowns without reloading from disk.
+
+3. **Restart the service** — The key file is always re-read at startup:
 
    ```sh
    launchctl unload ~/Library/LaunchAgents/com.antigravity.proxy.plist
    sleep 1
    launchctl load   ~/Library/LaunchAgents/com.antigravity.proxy.plist
-
    ```
+
 
 ---
 
@@ -974,21 +1081,29 @@ All tuneable constants in `main.py` and their effects:
 
 | Constant | Default | Location | Description |
 |---|---|---|---|
-| `KEYS_FILE` | `"api_keys.txt"` | L24 | Path to the key file (relative to `WorkingDirectory`) |
-| `UPSTREAM_BASE_GEMINI` | `https://generativelanguage.googleapis.com/v1beta` | L26 | Upstream API base URL |
-| `BACKOFF_MIN` | `5` | L33 | Seconds to cool down a key after a non-429 failure |
-| `BACKOFF_MAX` | `600` | L34 | Maximum backoff ceiling (currently unused in code; reserved) |
-| `COOLDOWN_PERIOD` | `60` | L35 | Seconds to cool down a key after a 429 rate-limit response |
-| `MAX_REQ_PER_KEY` | `15` | L36 | Requests per key before proactive rotation to the next key |
-| `LOG_DIR` | `"logs"` | L30 | Directory for application log files |
-| `LOG_FILE` | `"logs/proxy.log"` | L31 | Application log file path |
-| `RotatingFileHandler maxBytes` | `5 MB` | L67 | Max size before the app log file is rotated |
-| `RotatingFileHandler backupCount` | `3` | L67 | Number of rotated backup files to retain |
-| `httpx.AsyncClient timeout` (proxy) | `300` | L283 | Timeout in seconds for upstream Gemini API requests |
-| `httpx.AsyncClient timeout` (Telegram) | `30` | L170 | Timeout for Telegram API calls (must exceed long-poll) |
-| `TG long-poll timeout` | `20` | L171 | Telegram `getUpdates` long-poll duration (query parameter) |
-| `TG backoff max` | `300` | L167 | Maximum retry delay for Telegram errors (5 minutes) |
-| `TG alert rate limit` | `600` | L149 | Minimum seconds between Telegram alert messages |
+| `KEYS_FILE` | `"api_keys.txt"` | Proxy config | Path to the key file (relative to `WorkingDirectory`) |
+| `UPSTREAM_BASE_GEMINI` | `https://generativelanguage.googleapis.com/v1beta` | Proxy config | Upstream API base URL |
+| `BACKOFF_MIN` | `5` | Proxy config | Seconds to cool down a key after a non-429 failure |
+| `BACKOFF_MAX` | `600` | Proxy config | Maximum backoff ceiling (reserved for future use) |
+| `COOLDOWN_PERIOD` | `60` | Proxy config | Seconds to cool down a key after a 429 rate-limit response |
+| `MAX_REQ_PER_KEY` | `15` | Proxy config | Requests per key before proactive rotation to the next key |
+| `LOG_DIR` | `"logs"` | Logging | Directory for application log files |
+| `LOG_FILE` | `"logs/proxy.log"` | Logging | Application log file path |
+| `RotatingFileHandler maxBytes` | `5 MB` | Logging | Max size before the app log file is rotated |
+| `RotatingFileHandler backupCount` | `3` | Logging | Number of rotated backup files to retain |
+| `httpx.Timeout` (proxy) | `300s` (connect: `10s`) | Shared client | Timeout for upstream Gemini API requests; connect timeout is separate |
+| `httpx.Limits max_connections` | `100` | Shared client | Maximum concurrent outbound HTTP connections |
+| `httpx.Limits max_keepalive_connections` | `20` | Shared client | Persistent connections kept warm in the pool |
+| `httpx timeout` (Telegram long-poll) | `30s` | TelegramManager | Per-request timeout override for `getUpdates` calls |
+| `TG long-poll timeout` | `20s` | TelegramManager | Telegram `getUpdates` long-poll duration (query parameter) |
+| `TG backoff max` | `300s` | TelegramManager | Maximum retry delay for Telegram errors (5 min cap) |
+| `TG global_max_per_minute` | `5` | TelegramManager | Global cap on outbound Telegram notifications per minute |
+| `TG alert cooldown` (general) | `600s` | TelegramManager | Default per-topic cooldown for `send_alert()` calls |
+| `TG alert cooldown` (per-key bench) | `300s` | TelegramManager | Per-key cooldown for `notify_key_benched()` (429 / other errors) |
+| `TG alert cooldown` (auth errors) | `600s` | TelegramManager | Per-key cooldown for `notify_key_benched()` (401 / 403 errors) |
+| `TG alert cooldown` (pool health) | `300s` | TelegramManager | Cooldown for pool-degraded alerts (>50% keys benched) |
+| `Metrics.benchings` max length | `100` | Metrics | Maximum number of benching events retained in memory |
+| `ADMIN_TOKEN` | `changeme_local_only` | Security | Bearer token for remote access to internal endpoints |
 
 ### Scaling Tips
 
