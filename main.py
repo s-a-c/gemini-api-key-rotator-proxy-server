@@ -1,351 +1,1038 @@
 # main.py
-# FastAPI native Gemini proxy with rotating keys + API-key vs OAuth handling
-# pip install fastapi uvicorn httpx
+# FastAPI Gemini Proxy: Proactive Rotation, Log Tracking, Web Dashboard, and Telegram Bot
+# pip install fastapi uvicorn httpx python-dotenv
 
 import os
 import time
+import uuid
 import asyncio
 import json
-import random
-from typing import List, Optional, Dict, Any
-
-from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import Response, JSONResponse, StreamingResponse
-import httpx
 import logging
+import contextvars
+from contextlib import asynccontextmanager
+from typing import List, Optional, Dict, Any
+from logging.handlers import RotatingFileHandler
 
-log = logging.getLogger("uvicorn")
-APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)")
+# ── .env support (soft dependency) ──────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed; rely on system env vars
 
-# -------------------------
-# Config
-# -------------------------
-VPN_PROXY_URL = ""  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
-KEYS_FILE = "api_keys.txt" # api keys, one per line
-ADMIN_TOKEN = "changeme_local_only"
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, JSONResponse, StreamingResponse, HTMLResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+import httpx
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Configuration & Global State
+# ─────────────────────────────────────────────────────────────────────────────
+PROJECT_NAME = "Antigravity-Proxy"
+KEYS_FILE = "api_keys.txt"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "changeme_local_only")
 UPSTREAM_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta"
+
+# Logging
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "proxy.log")
+
+# Rotation & Health Config
 BACKOFF_MIN = 5
 BACKOFF_MAX = 600
-DEBUG = False
+COOLDOWN_PERIOD = 60   # strict cooldown for 429 errors (seconds)
+MAX_REQ_PER_KEY = 15   # proactively rotate after N requests
 
-# -------------------------
-# Setup proxy from config (optional http proxy)
-# -------------------------
-if VPN_PROXY_URL:
-    proxy_url_with_scheme = VPN_PROXY_URL if "://" in VPN_PROXY_URL else f"http://{VPN_PROXY_URL}"
-    os.environ['HTTP_PROXY'] = proxy_url_with_scheme
-    os.environ['HTTPS_PROXY'] = proxy_url_with_scheme
-    os.environ['ALL_PROXY'] = proxy_url_with_scheme
+# Telegram (read from environment; leave unset to disable)
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
-# -------------------------
-# Utilities: load keys
-# -------------------------
-def load_keys_from_file(path: str) -> List[str]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"API keys file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        keys = [line.strip() for line in f if line.strip()]
-    if not keys:
-        raise RuntimeError("No API keys found in file.")
-    return keys
+# Async-safe request-ID storage
+request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="init"
+)
 
-KEYS_LIST = load_keys_from_file(KEYS_FILE)
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Logging
+# ─────────────────────────────────────────────────────────────────────────────
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
 
-# -------------------------
-# Key state & pool (simple backoff-based)
-# -------------------------
+
+class RequestIDFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_ctx.get()  # type: ignore[attr-defined]
+        return True
+
+
+_fmt = logging.Formatter("%(asctime)s [%(request_id)s] %(levelname)s - %(message)s")
+
+log = logging.getLogger("antigravity")
+log.setLevel(logging.INFO)
+log.propagate = False
+
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+_file_handler.addFilter(RequestIDFilter())
+_file_handler.setFormatter(_fmt)
+log.addHandler(_file_handler)
+
+_stderr_handler = logging.StreamHandler()
+_stderr_handler.addFilter(RequestIDFilter())
+_stderr_handler.setFormatter(_fmt)
+log.addHandler(_stderr_handler)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Key State & Pool
+# ─────────────────────────────────────────────────────────────────────────────
 class KeyState:
-    def __init__(self, key: str):
-        self.key: str = key
-        self.backoff: float = 0.0
+    def __init__(self, key: str) -> None:
+        self.key = key
         self.banned_until: float = 0.0
+        self.usage_count: int = 0
         self.success: int = 0
         self.fail: int = 0
 
     def is_available(self) -> bool:
-        return time.monotonic() >= self.banned_until
+        return time.monotonic() >= self.banned_until and self.usage_count < MAX_REQ_PER_KEY
 
     def mark_success(self) -> None:
-        self.backoff = 0.0
         self.banned_until = 0.0
         self.success += 1
+        self.usage_count += 1
 
-    def mark_failure(self) -> None:
-        if self.backoff <= 0:
-            self.backoff = BACKOFF_MIN
-        else:
-            self.backoff = min(BACKOFF_MAX, self.backoff * 2.0)
-        self.banned_until = time.monotonic() + self.backoff
+    def mark_failure(self, status_code: int) -> None:
+        wait = COOLDOWN_PERIOD if status_code == 429 else BACKOFF_MIN
+        self.banned_until = time.monotonic() + wait
+        self.usage_count = 0
         self.fail += 1
 
 
 class KeyPool:
-    def __init__(self, keys: List[str]):
-        self.states: List[KeyState] = [KeyState(k) for k in keys]
-        self.n: int = len(self.states)
-        self.idx: int = 0
+    def __init__(self, keys: List[str]) -> None:
+        self.states = [KeyState(k) for k in keys]
         self.lock = asyncio.Lock()
 
     async def next_available(self) -> Optional[KeyState]:
         async with self.lock:
-            start = self.idx
-            for i in range(self.n):
-                j = (start + i) % self.n
-                st = self.states[j]
-                if st.is_available():
-                    self.idx = (j + 1) % self.n
-                    return st
-            return None
+            available = [s for s in self.states if s.is_available()]
+            if not available:
+                # Fallback: pick the one waking up soonest
+                self.states.sort(key=lambda x: x.banned_until)
+                best = self.states[0]
+                if time.monotonic() >= best.banned_until:
+                    best.usage_count = 0
+                    return best
+                return None
+            available.sort(key=lambda x: x.usage_count)
+            return available[0]
 
     def status(self) -> List[Dict[str, Any]]:
         now = time.monotonic()
-        out: List[Dict[str, Any]] = []
-        for s in self.states:
-            out.append({
-                "key_preview": (s.key[:12] + "...") if len(s.key) > 8 else s.key,
+        return [
+            {
+                "key_preview": s.key[:12] + "...",
                 "available_in": max(0, round(s.banned_until - now, 2)),
-                "backoff": s.backoff,
+                "usage": s.usage_count,
                 "success": s.success,
                 "fail": s.fail,
-            })
-        return out
+            }
+            for s in self.states
+        ]
 
 
-POOL = KeyPool(KEYS_LIST)
-
-# -------------------------
-# Routing helpers (fixed: avoid double v1/v1beta)
-# -------------------------
-def map_incoming_to_upstream(path: str) -> str:
-    """
-    Map incoming path -> native Gemini upstream URL.
-    Strip leading 'v1/' or 'v1beta/' if present to avoid duplication.
-    """
-    p = path.lstrip("/")
-    if p.startswith("v1/"):
-        p = p[len("v1/"):]
-    elif p.startswith("v1beta/"):
-        p = p[len("v1beta/"):]
-    # avoid trailing slash duplication
-    if p == "":
-        return UPSTREAM_BASE_GEMINI.rstrip("/")
-    return UPSTREAM_BASE_GEMINI.rstrip("/") + "/" + p
+def load_keys_from_file(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-def detect_stream_from_request(content_bytes: Optional[bytes], query_params: Dict[str, Any]) -> bool:
-    # Gemini native streaming uses alt=sse
-    if query_params.get("alt") == "sse":
-        return True
-    # Also support stream=true for compatibility with some clients
-    qp = query_params.get("stream")
-    if qp in ("true", "True", "1", True):
-        return True
-    if content_bytes:
+POOL = KeyPool(load_keys_from_file(KEYS_FILE))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Metrics
+# ─────────────────────────────────────────────────────────────────────────────
+class Metrics:
+    def __init__(self) -> None:
+        self.start_time = time.time()
+        self.total_requests: int = 0
+        self.total_success: int = 0
+        self.total_fail: int = 0
+        self.total_429: int = 0
+        self.rotations: int = 0
+        self.benchings: List[Dict[str, Any]] = []
+
+    def record_success(self) -> None:
+        self.total_requests += 1
+        self.total_success += 1
+
+    def record_failure(self, status_code: int) -> None:
+        self.total_requests += 1
+        self.total_fail += 1
+        if status_code == 429:
+            self.total_429 += 1
+
+    def record_benching(self, key_preview: str, status_code: int, duration: float) -> None:
+        self.benchings.append({
+            "time": time.time(),
+            "key": key_preview,
+            "status": status_code,
+            "duration": duration,
+        })
+        if len(self.benchings) > 100:
+            self.benchings = self.benchings[-100:]
+
+    def record_rotation(self) -> None:
+        self.rotations += 1
+
+    def uptime(self) -> float:
+        return time.time() - self.start_time
+
+    def uptime_str(self) -> str:
+        s = int(self.uptime())
+        d, s = divmod(s, 86400)
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        parts: List[str] = []
+        if d:
+            parts.append(f"{d}d")
+        if h:
+            parts.append(f"{h}h")
+        if m:
+            parts.append(f"{m}m")
+        parts.append(f"{s}s")
+        return " ".join(parts)
+
+    def summary(self) -> Dict[str, Any]:
+        total = max(self.total_requests, 1)
+        return {
+            "uptime_seconds": round(self.uptime(), 1),
+            "uptime_human": self.uptime_str(),
+            "total_requests": self.total_requests,
+            "total_success": self.total_success,
+            "total_fail": self.total_fail,
+            "total_429": self.total_429,
+            "success_rate_pct": round(self.total_success / total * 100, 1),
+            "rotations": self.rotations,
+            "recent_benchings": self.benchings[-10:],
+        }
+
+
+METRICS = Metrics()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Telegram Manager
+# ─────────────────────────────────────────────────────────────────────────────
+class TelegramManager:
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+        # Per-topic cooldowns: topic -> last send timestamp
+        self.alert_cooldowns: Dict[str, float] = {}
+        # Global rate limit: sliding window of send timestamps
+        self.global_sends: List[float] = []
+        self.global_max_per_minute = 5
+
+    # ── Rate limiting ────────────────────────────────────────────────────────
+
+    def _can_send(self, topic: str, cooldown: int = 600) -> bool:
+        """Check per-topic cooldown AND global rate limit."""
+        now = time.time()
+        if now - self.alert_cooldowns.get(topic, 0.0) < cooldown:
+            return False
+        # Prune old entries and check global cap
+        self.global_sends = [t for t in self.global_sends if now - t < 60]
+        return len(self.global_sends) < self.global_max_per_minute
+
+    def _mark_sent(self, topic: str) -> None:
+        now = time.time()
+        self.alert_cooldowns[topic] = now
+        self.global_sends.append(now)
+
+    # ── Outbound helpers ─────────────────────────────────────────────────────
+
+    async def _send_message(
+        self,
+        client: httpx.AsyncClient,
+        text: str,
+        keyboard: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+        if keyboard:
+            payload["reply_markup"] = keyboard
         try:
-            j = json.loads(content_bytes.decode(errors="ignore"))
-            if isinstance(j, dict) and j.get("stream") is True:
-                return True
+            await client.post(
+                f"{self.base_url}/sendMessage", json=payload, timeout=10
+            )
+        except Exception as e:
+            log.warning(f"TG _send_message failed: {repr(e)}")
+
+    async def send_alert(
+        self,
+        text: str,
+        topic: str = "general",
+        cooldown: int = 600,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> None:
+        if not TG_ENABLED:
+            return
+        if not self._can_send(topic, cooldown):
+            return
+        payload = {
+            "chat_id": self.chat_id,
+            "text": f"🚨 *{PROJECT_NAME}*\n{text}",
+            "parse_mode": "Markdown",
+        }
+        _client = client or httpx.AsyncClient()
+        try:
+            await _client.post(
+                f"{self.base_url}/sendMessage", json=payload, timeout=10
+            )
+            self._mark_sent(topic)
+        except Exception as e:
+            log.warning(f"TG send_alert failed: {repr(e)}")
+        finally:
+            if not client:
+                await _client.aclose()
+
+    async def notify_key_benched(
+        self,
+        key_preview: str,
+        status_code: int,
+        duration: float,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> None:
+        """Notify when a key is benched due to upstream failure."""
+        topic = f"bench_{key_preview}"
+        if status_code == 429:
+            emoji, reason, cd = "🔴", "rate limit", 300
+        elif status_code in (401, 403):
+            emoji, reason, cd = "❌", "auth error", 600
+        else:
+            emoji, reason, cd = "⚠️", f"HTTP {status_code}", 300
+        text = f"{emoji} Key `{key_preview}` benched for {int(duration)}s — {reason}"
+        await self.send_alert(text, topic=topic, cooldown=cd, client=client)
+
+    # ── Command handlers ─────────────────────────────────────────────────────
+
+    async def _cmd_help(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        text = (
+            f"🤖 *{PROJECT_NAME} Bot Commands*\n\n"
+            "/help — Show this message\n"
+            "/status — Key pool status with action buttons\n"
+            "/rotate — Reset all usage counters and cooldowns\n"
+            "/ban `<key>` `[seconds]` — Bench a key (default 24h)\n"
+            "/unban — Clear all cooldowns\n"
+            "/uptime — Proxy uptime and request stats\n"
+            "/config — Show current configuration\n"
+            "/digest — On-demand health summary\n"
+        )
+        await self._send_message(client, text)
+
+    async def _cmd_status(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        pool = POOL.status()
+        available = sum(1 for k in pool if k["available_in"] == 0)
+        lines = [f"📊 *{PROJECT_NAME} Status* ({available}/{len(pool)} available)\n"]
+        for k in pool:
+            if k["available_in"] > 0:
+                state_str = f"🔴 cooldown {k['available_in']}s"
+            else:
+                state_str = "🟢 active"
+            lines.append(
+                f"• `{k['key_preview']}`: {k['usage']} reqs, "
+                f"{k['success']}✓ {k['fail']}✗ — {state_str}"
+            )
+        kb: Dict[str, Any] = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Reload Keys", "callback_data": "reload"},
+                    {"text": "🔃 Rotate All",  "callback_data": "rotate"},
+                ],
+                [{"text": "✅ Unban All", "callback_data": "unban"}],
+            ]
+        }
+        await self._send_message(client, "\n".join(lines), keyboard=kb)
+
+    async def _cmd_rotate(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        async with POOL.lock:
+            for s in POOL.states:
+                s.usage_count = 0
+                s.banned_until = 0.0
+        METRICS.record_rotation()
+        await self._send_message(
+            client,
+            "🔃 All keys rotated — usage counters and cooldowns cleared.",
+        )
+        await self._cmd_status(client, msg)
+
+    async def _cmd_ban(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        parts = msg.get("text", "").split()
+        if len(parts) < 2:
+            await self._send_message(
+                client,
+                "Usage: `/ban <key_preview> [seconds]`\n"
+                "Example: `/ban AIzaSyCDpw 3600` (ban for 1h)\n"
+                "Default duration: 86400s (24h)",
+            )
+            return
+        preview = parts[1].rstrip(".")
+        try:
+            duration = int(parts[2]) if len(parts) > 2 else 86400
+        except ValueError:
+            await self._send_message(client, "❌ Duration must be an integer (seconds).")
+            return
+        for s in POOL.states:
+            if s.key.startswith(preview):
+                s.banned_until = time.monotonic() + duration
+                if duration >= 3600:
+                    dur_str = f"{duration // 3600}h {(duration % 3600) // 60}m"
+                else:
+                    dur_str = f"{duration}s"
+                METRICS.record_benching(s.key[:12] + "...", 0, duration)
+                await self._send_message(
+                    client, f"🚫 Banned `{s.key[:12]}...` for {dur_str}"
+                )
+                return
+        await self._send_message(
+            client,
+            f"❌ No key matching `{preview}` found.\n"
+            f"Hint: use the first few chars shown in /status, e.g. `/ban AIzaSy`",
+        )
+
+    async def _cmd_unban(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        count = 0
+        async with POOL.lock:
+            now = time.monotonic()
+            for s in POOL.states:
+                if s.banned_until > now:
+                    s.banned_until = 0.0
+                    count += 1
+        if count:
+            await self._send_message(client, f"✅ Cleared cooldowns on {count} key(s)")
+        else:
+            await self._send_message(client, "✅ No keys were in cooldown")
+        await self._cmd_status(client, msg)
+
+    async def _cmd_uptime(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        m = METRICS.summary()
+        available = sum(1 for s in POOL.states if s.is_available())
+        total_keys = len(POOL.states)
+        text = (
+            f"⏱ *{PROJECT_NAME} Uptime*\n\n"
+            f"Uptime: `{m['uptime_human']}`\n"
+            f"Requests: `{m['total_requests']:,}` "
+            f"({m['total_success']:,}✓ {m['total_fail']:,}✗)\n"
+            f"Success rate: `{m['success_rate_pct']}%`\n"
+            f"429 events: `{m['total_429']}`\n"
+            f"Key rotations: `{m['rotations']}`\n"
+            f"Keys available: `{available}/{total_keys}`"
+        )
+        await self._send_message(client, text)
+
+    async def _cmd_config(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        text = (
+            f"⚙️ *{PROJECT_NAME} Config*\n\n"
+            f"Keys loaded: `{len(POOL.states)}`\n"
+            f"Max req/key: `{MAX_REQ_PER_KEY}`\n"
+            f"Cooldown (429): `{COOLDOWN_PERIOD}s`\n"
+            f"Backoff (other): `{BACKOFF_MIN}s`\n"
+            f"Upstream timeout: `300s`\n"
+            f"TG enabled: `{TG_ENABLED}`\n"
+            f"Host: `0.0.0.0:8888`"
+        )
+        await self._send_message(client, text)
+
+    async def _cmd_digest(self, client: httpx.AsyncClient, msg: Dict) -> None:
+        m = METRICS.summary()
+        available = sum(1 for s in POOL.states if s.is_available())
+        total_keys = len(POOL.states)
+        lines = [
+            f"📊 *{PROJECT_NAME} Digest*\n",
+            f"Uptime: `{m['uptime_human']}`",
+            f"Requests: `{m['total_requests']:,}` ({m['success_rate_pct']}% success)",
+            f"429 events: `{m['total_429']}`",
+            f"Keys: `{available}/{total_keys}` available\n",
+        ]
+        recent = m.get("recent_benchings", [])
+        if recent:
+            lines.append("*Recent events:*")
+            now = time.time()
+            for ev in reversed(recent[-5:]):
+                ago = int(now - ev["time"])
+                if ago < 60:
+                    ago_str = f"{ago}s ago"
+                elif ago < 3600:
+                    ago_str = f"{ago // 60}m ago"
+                else:
+                    ago_str = f"{ago // 3600}h {(ago % 3600) // 60}m ago"
+                lines.append(
+                    f"• {ago_str}: `{ev['key']}` benched {int(ev['duration'])}s "
+                    f"(HTTP {ev['status']})"
+                )
+        else:
+            lines.append("_No recent events._")
+        await self._send_message(client, "\n".join(lines))
+
+    # ── Callback handlers ────────────────────────────────────────────────────
+
+    async def _cb_reload(self, client: httpx.AsyncClient, cb: Dict) -> None:
+        global POOL
+        new_keys = load_keys_from_file(KEYS_FILE)
+        POOL = KeyPool(new_keys)
+        log.info(f"Keys reloaded via TG: {len(new_keys)} keys")
+        try:
+            await client.post(
+                f"{self.base_url}/answerCallbackQuery",
+                json={"callback_query_id": cb["id"], "text": "Keys Reloaded!"},
+                timeout=10,
+            )
         except Exception:
             pass
-    return False
+        await self._cmd_status(client, cb)
 
+    async def _cb_rotate(self, client: httpx.AsyncClient, cb: Dict) -> None:
+        try:
+            await client.post(
+                f"{self.base_url}/answerCallbackQuery",
+                json={"callback_query_id": cb["id"], "text": "Keys Rotated!"},
+                timeout=10,
+            )
+        except Exception:
+            pass
+        await self._cmd_rotate(client, cb)
 
-def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict[str, Any], key_state: KeyState):
-    """
-    Return (headers_copy, params_copy) where authentication for key_state.key is applied.
-    - If key looks like API key (starts with 'AIza'), put it as params['key'].
-    - Otherwise set Authorization: Bearer <key>.
-    """
-    headers = dict(incoming_headers)
-    params = dict(incoming_params) if incoming_params is not None else {}
+    async def _cb_unban(self, client: httpx.AsyncClient, cb: Dict) -> None:
+        try:
+            await client.post(
+                f"{self.base_url}/answerCallbackQuery",
+                json={"callback_query_id": cb["id"], "text": "Cooldowns Cleared!"},
+                timeout=10,
+            )
+        except Exception:
+            pass
+        await self._cmd_unban(client, cb)
 
-    k = key_state.key.strip()
-    # heuristic: Google API keys usually start with "AIza"
-    if k.startswith("AIza"):
-        # use query parameter 'key' for API key (do not set Authorization)
-        params['key'] = k
-        if 'authorization' in {x.lower() for x in headers.keys()}:
-            # remove incoming Authorization to avoid confusion
-            headers = {hk: hv for hk, hv in headers.items() if hk.lower() != 'authorization'}
-        auth_mode = "api_key(query)"
-    else:
-        # assume OAuth access token / service account token etc.
-        headers['Authorization'] = f"Bearer {k}"
-        auth_mode = "bearer_header"
-    if DEBUG:
-        print(f"[DEBUG] auth mode {auth_mode} for key preview {k[:12]}...")
-    return headers, params
+    # ── Main polling loop ────────────────────────────────────────────────────
 
+    async def handle_commands(self, client: httpx.AsyncClient) -> None:
+        if not TG_ENABLED:
+            log.info("Telegram integration disabled (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set)")
+            return
 
-# -------------------------
-# Catch-all proxy endpoint
-# -------------------------
-@APP.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def catch_all(request: Request, full_path: str):
-    upstream_url = map_incoming_to_upstream(full_path)
-    content = await request.body()
-    params = dict(request.query_params)
+        cmd_handlers: Dict[str, Any] = {
+            "/help":   self._cmd_help,
+            "/status": self._cmd_status,
+            "/rotate": self._cmd_rotate,
+            "/ban":    self._cmd_ban,
+            "/unban":  self._cmd_unban,
+            "/uptime": self._cmd_uptime,
+            "/config": self._cmd_config,
+            "/digest": self._cmd_digest,
+        }
+        cb_handlers: Dict[str, Any] = {
+            "reload": self._cb_reload,
+            "rotate": self._cb_rotate,
+            "unban":  self._cb_unban,
+        }
 
-    # copy incoming headers but skip hop-by-hop
-    incoming_headers: Dict[str, str] = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
-    }
+        offset = 0
+        backoff = 5
 
-    is_stream = detect_stream_from_request(content if content else None, params)
-
-    if is_stream and ":generateContent" in upstream_url:
-        upstream_url = upstream_url.replace(":generateContent", ":streamGenerateContent")
-        if 'stream' in params:
-            del params['stream']
-
-    # --- Streaming requests ---
-    if is_stream:
-        async def stream_generator():
-            tried_keys, logged_errors = [], []
-            for _ in range(len(POOL.states)):
-                key_state = await POOL.next_available()
-                if not key_state: break
-                tried_keys.append(key_state.key[:12] + "...")
-                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
-                if not any(k.lower() == "content-type" for k in headers_auth.keys()):
-                    headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
-
-                if DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
-                try:
-                    async with httpx.AsyncClient(timeout=300) as client, client.stream(
-                        request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
-                    ) as upstream:
-                        if upstream.status_code >= 400:
-                            key_state.mark_failure()
-                            body = await upstream.aread()
-                            logged_errors.append({"key": key_state.key[:12], "status": upstream.status_code, "body": body.decode(errors='ignore')})
-                            log.warning(f"Key {key_state.key[:12]}... failed on stream connection with status {upstream.status_code}. Retrying...")
-                            continue
-
-                        is_first_chunk, stream_had_error = True, False
-                        async for chunk in upstream.aiter_bytes():
-                            if is_first_chunk:
-                                is_first_chunk = False
-                                # Gemini streams a 'data: ' prefix, which we can ignore for error checking
-                                chunk_content_for_check = chunk
-                                if chunk_content_for_check.startswith(b'data: '):
-                                    chunk_content_for_check = chunk_content_for_check[len(b'data: '):]
-                                
-                                try:
-                                    # The first chunk might be a list with a single error object
-                                    data = json.loads(chunk_content_for_check.decode())
-                                    if isinstance(data, list): data = data
-
-                                    if isinstance(data, dict) and "error" in data:
-                                        key_state.mark_failure()
-                                        stream_had_error = True
-                                        msg = data.get("error", {}).get("message", "Unknown stream error")
-                                        logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "body": msg})
-                                        if DEBUG: print(f"[DEBUG] In-stream error for key {key_state.key[:12]}...: {msg}")
-                                        break 
-                                except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
-                            yield chunk
-                        
-                        if stream_had_error: continue
-                        key_state.mark_success()
-                        client_info = f" to {request.client.host}:{request.client.port}" if request.client else ""
-                        log.info(f"Stream{client_info} completed successfully with key {key_state.key[:12]}...")
-                        return
-                except httpx.RequestError as e:
-                    key_state.mark_failure()
-                    logged_errors.append({"key": key_state.key[:12], "error": str(e)})
-                    if DEBUG: print(f"[DEBUG] Request error for stream key {key_state.key[:12]}...: {e}")
-                    continue
-            
-            if not tried_keys:
-                log.error("All keys are within rate limit. Could not process stream request.")
-
-            #FIXME: Roo Code doesn't understand this error
-            final_error = {"error": {"code": 502, "message": "All keys failed for streaming request.", "details": logged_errors}}
-            yield (f"data: {json.dumps(final_error)}\r\n\r\n").encode()
-        
-        return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
-
-    # --- Non-streaming requests ---
-    else:
-        tried, errors = [], []
-        for _ in range(len(POOL.states)):
-            key_state = await POOL.next_available()
-            if not key_state: break
-            tried.append(key_state.key[:12] + "...")
-            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
-            if not any(k.lower() == "content-type" for k in headers_auth.keys()):
-                headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
-
-            if DEBUG: print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url}")
+        while True:
             try:
-                async with httpx.AsyncClient(timeout=300) as client:
-                    resp = await client.request(request.method, upstream_url, headers=headers_auth, params=params_auth, content=content)
-                
-                if resp.status_code < 400:
-                    key_state.mark_success()
-                    client_info = f" from {request.client.host}:{request.client.port}" if request.client else ""
-                    log.info(f"Request{client_info} completed successfully with key {key_state.key[:12]}...")
-                    return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+                resp = await client.get(
+                    f"{self.base_url}/getUpdates",
+                    params={"offset": offset, "timeout": 20},
+                    timeout=30,
+                )
+                data = resp.json()
+                if not data.get("ok"):
+                    raise RuntimeError(
+                        f"Telegram API error: {data.get('description', 'unknown')}"
+                    )
+                updates = data.get("result", [])
+                backoff = 5  # reset on success
 
-                # It's an error, mark failure
-                key_state.mark_failure()
-                error_body_str = resp.text
-                if DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... failed with status {resp.status_code}, body: {error_body_str[:200]}")
+                for u in updates:
+                    offset = u["update_id"] + 1
+                    msg = u.get("message", {})
+                    cb  = u.get("callback_query", {})
+                    cid = str(
+                        msg.get("chat", {}).get("id",
+                        cb.get("from", {}).get("id", ""))
+                    )
 
-                # Also treat 400 as retryable for cases like invalid API keys
-                if resp.status_code in (400, 429, 500, 502, 503):
-                    errors.append({"key_preview": key_state.key[:12] + "...", "error": error_body_str, "status_code": resp.status_code})
-                    continue # Retryable error, try next key
-                else:
-                    # Non-retryable error, return immediately
-                    return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+                    if cid != self.chat_id:
+                        continue
 
-            except httpx.RequestError as e:
-                key_state.mark_failure()
-                errors.append({"key_preview": key_state.key[:12] + "...", "error": str(e)})
-                if DEBUG: print(f"[DEBUG] Request error for key {key_state.key[:12]}...: {e}")
+                    # Inline button callback
+                    cb_data = cb.get("data", "")
+                    if cb_data and cb_data in cb_handlers:
+                        try:
+                            await cb_handlers[cb_data](client, cb)
+                        except Exception as e:
+                            log.error(f"TG callback error [{cb_data}]: {repr(e)}")
+                        continue
+
+                    # Text command
+                    text = msg.get("text", "").strip()
+                    cmd = text.split()[0].lower() if text else ""
+                    if cmd in cmd_handlers:
+                        try:
+                            await cmd_handlers[cmd](client, msg)
+                        except Exception as e:
+                            log.error(f"TG command error [{cmd}]: {repr(e)}")
+
+            except asyncio.CancelledError:
+                log.info("TG Listener shutting down")
+                return
+            except Exception as e:
+                log.error(f"TG Listener error: {repr(e)}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
                 continue
 
-        if not tried:
-            log.error("All keys are in backoff. Could not process request.")
-            return JSONResponse({"error": "all keys rate-limited or in backoff"}, status_code=429)
-        return JSONResponse({"error": "no upstream key succeeded", "tried": tried, "errors": errors}, status_code=502)
+            await asyncio.sleep(1)
 
 
-# -------------------------
-# Admin endpoints
-# -------------------------
-def is_admin(auth_header: Optional[str]) -> bool:
-    if not auth_header:
-        return False
-    if auth_header == ADMIN_TOKEN:
-        return True
-    low = auth_header.lower()
-    if low.startswith("bearer "):
-        return auth_header.split(" ", 1) == ADMIN_TOKEN
-    return False
+TG = TelegramManager(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Application Lifespan (replaces deprecated @on_event("startup"))
+# ─────────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──────────────────────────────────────────────────────────────
+    app.state.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    app.state.tg_task = None
+
+    if TG_ENABLED:
+        app.state.tg_task = asyncio.create_task(
+            TG.handle_commands(app.state.http_client)
+        )
+        log.info("Telegram listener started")
+    else:
+        log.info("Telegram integration disabled (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set)")
+
+    log.info(f"{PROJECT_NAME} started — {len(POOL.states)} keys loaded")
+
+    yield  # ── App is running ────────────────────────────────────────────────
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    if app.state.tg_task:
+        app.state.tg_task.cancel()
+        try:
+            await app.state.tg_task
+        except asyncio.CancelledError:
+            pass
+
+    await app.state.http_client.aclose()
+    log.info(f"{PROJECT_NAME} shutdown complete")
 
 
-@APP.get("/status")
-async def status(x_proxy_admin: Optional[str] = Header(None)):
-    if not is_admin(x_proxy_admin):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return JSONResponse({"keys": POOL.status()})
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. FastAPI App & Middleware
+# ─────────────────────────────────────────────────────────────────────────────
+APP = FastAPI(title="Native Gemini Proxy (Fully Loaded)", lifespan=lifespan)
 
 
-@APP.post("/reload-keys")
-async def reload_keys(x_proxy_admin: Optional[str] = Header(None)):
-    if not is_admin(x_proxy_admin):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    global KEYS_LIST, POOL
-    KEYS_LIST = load_keys_from_file(KEYS_FILE)
-    POOL = KeyPool(KEYS_LIST)
-    return JSONResponse({"reloaded": True, "num_keys": len(KEYS_LIST)})
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = str(uuid.uuid4())[:8]
+        token = request_id_ctx.set(rid)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            request_id_ctx.reset(token)
 
 
-# -------------------------
-# Run note:
-# uvicorn main:APP --host 127.0.0.1 --port 8000
-# -------------------------
+APP.add_middleware(RequestIDMiddleware)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Routing Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+INTERNAL_ROUTES = {"dashboard", "logs", "status", "reload-keys", "health", "pool-status"}
+
+
+def prepare_auth(
+    key_state: KeyState,
+    headers: Dict[str, str],
+    params: Dict[str, str],
+) -> tuple:
+    h = {k: v for k, v in headers.items()
+         if k.lower() not in ("host", "content-length", "authorization")}
+    p = dict(params)
+    if key_state.key.startswith("AIza"):
+        p["key"] = key_state.key
+    else:
+        h["Authorization"] = f"Bearer {key_state.key}"
+    return h, p
+
+
+def _pool_health_alert(client: httpx.AsyncClient) -> None:
+    """Fire-and-forget pool degradation alert."""
+    benched = sum(1 for s in POOL.states if not s.is_available())
+    total   = len(POOL.states)
+    if benched > total // 2:
+        asyncio.create_task(
+            TG.send_alert(
+                f"⚠️ Pool degraded: {benched}/{total} keys currently benched",
+                topic="pool_health",
+                cooldown=300,
+                client=client,
+            )
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Main Proxy Route
+# ─────────────────────────────────────────────────────────────────────────────
+@APP.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"],
+)
+async def catch_all(request: Request, path: str):
+    # 1. HEAD -> quick health probe
+    if request.method == "HEAD":
+        return Response(status_code=200)
+
+    # 2. Normalise path: strip leading version prefix only, not mid-path
+    clean_path = path.lstrip("/")
+    clean_path = clean_path.removeprefix("v1beta/").removeprefix("v1/")
+    clean_path = clean_path.strip("/")
+
+    # 3. Internal routes
+    if clean_path in INTERNAL_ROUTES:
+        return await handle_internal(request, clean_path)
+
+    # 4. Proxy to Google
+    upstream_url = f"{UPSTREAM_BASE_GEMINI}/{clean_path}"
+    body   = await request.body()
+    params = dict(request.query_params)
+    is_stream = (
+        "alt=sse" in str(request.query_params)
+        or ":streamGenerateContent" in upstream_url
+    )
+
+    client = request.app.state.http_client
+
+    for _ in range(len(POOL.states)):
+        key_state = await POOL.next_available()
+        if not key_state:
+            asyncio.create_task(
+                TG.send_alert(
+                    "All keys exhausted — pool fully rate-limited!",
+                    topic="exhausted",
+                    cooldown=300,
+                    client=client,
+                )
+            )
+            return JSONResponse({"error": "all keys rate-limited"}, status_code=429)
+
+        h, p = prepare_auth(key_state, dict(request.headers), params)
+
+        try:
+            if is_stream:
+                # Capture loop-locals in default args so each iteration gets
+                # its own copies; shared client is never closed mid-stream.
+                async def stream_wrapper(
+                    _ks=key_state, _h=h, _p=p, _cl=client
+                ):
+                    async with _cl.stream(
+                        request.method, upstream_url,
+                        headers=_h, params=_p, content=body,
+                    ) as r:
+                        if r.status_code >= 400:
+                            benching_dur = (
+                                COOLDOWN_PERIOD if r.status_code == 429
+                                else BACKOFF_MIN
+                            )
+                            _ks.mark_failure(r.status_code)
+                            METRICS.record_failure(r.status_code)
+                            METRICS.record_benching(
+                                _ks.key[:12] + "...", r.status_code, benching_dur
+                            )
+                            asyncio.create_task(
+                                TG.notify_key_benched(
+                                    _ks.key[:12] + "...",
+                                    r.status_code,
+                                    benching_dur,
+                                    client=_cl,
+                                )
+                            )
+                            _pool_health_alert(_cl)
+                            yield (
+                                f"data: {json.dumps({'error': 'stream error'})}\n\n"
+                                .encode()
+                            )
+                            return
+                        _ks.mark_success()
+                        METRICS.record_success()
+                        async for chunk in r.aiter_bytes():
+                            yield chunk
+
+                return StreamingResponse(
+                    stream_wrapper(), media_type="text/event-stream"
+                )
+
+            else:
+                r = await client.request(
+                    request.method, upstream_url,
+                    headers=h, params=p, content=body,
+                )
+                if r.status_code < 400:
+                    key_state.mark_success()
+                    METRICS.record_success()
+                    return Response(
+                        content=r.content,
+                        status_code=r.status_code,
+                        headers=dict(r.headers),
+                    )
+
+                benching_dur = COOLDOWN_PERIOD if r.status_code == 429 else BACKOFF_MIN
+                key_state.mark_failure(r.status_code)
+                METRICS.record_failure(r.status_code)
+                METRICS.record_benching(
+                    key_state.key[:12] + "...", r.status_code, benching_dur
+                )
+                asyncio.create_task(
+                    TG.notify_key_benched(
+                        key_state.key[:12] + "...",
+                        r.status_code,
+                        benching_dur,
+                        client=client,
+                    )
+                )
+                _pool_health_alert(client)
+                log.warning(
+                    f"Upstream {r.status_code} for {clean_path} — "
+                    f"benching {key_state.key[:12]}... for {benching_dur}s"
+                )
+                continue
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            benching_dur = BACKOFF_MIN
+            key_state.mark_failure(500)
+            METRICS.record_failure(500)
+            METRICS.record_benching(key_state.key[:12] + "...", 500, benching_dur)
+            asyncio.create_task(
+                TG.notify_key_benched(
+                    key_state.key[:12] + "...", 500, benching_dur, client=client
+                )
+            )
+            _pool_health_alert(client)
+            log.error(f"Request error for {clean_path}: {repr(e)}")
+
+    return JSONResponse({"error": "no upstream key succeeded"}, status_code=502)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Internal Endpoints & Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+_DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Antigravity Proxy Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
+  h2 { color: #9cdcfe; margin-bottom: 16px; }
+  h3 { color: #9cdcfe; margin: 16px 0 8px; }
+  #metrics {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    margin-bottom: 20px; padding: 12px 16px;
+    background: #2d2d2d; border-radius: 6px; font-size: 13px;
+  }
+  #metrics span { white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 4px; }
+  th { text-align: left; padding: 6px 8px; background: #2d2d2d; color: #9cdcfe; border-bottom: 1px solid #444; }
+  td { padding: 5px 8px; border-bottom: 1px solid #333; }
+  tr:hover td { background: #252525; }
+  #log-box {
+    background: #000; padding: 12px; height: 45vh;
+    overflow-y: scroll; border-radius: 4px; font-size: 12px;
+    border: 1px solid #333;
+  }
+  .ok   { color: #4ec9b0; }
+  .fail { color: #f44747; }
+  .pill-green { color: #4ec9b0; }
+  .pill-red   { color: #f44747; }
+</style>
+</head>
+<body>
+<h2>&#x1F6F8; Antigravity Proxy Dashboard</h2>
+
+<div id="metrics">
+  <span>&#x23F1; <span id="m-uptime">-</span></span>
+  <span>&#x1F4E8; <span id="m-reqs">0</span> reqs</span>
+  <span class="ok">&#x2713; <span id="m-ok">0</span></span>
+  <span class="fail">&#x2717; <span id="m-fail">0</span></span>
+  <span>&#x1F534; <span id="m-429">0</span> rate-limited</span>
+  <span>&#x1F4CA; <span id="m-rate">-</span>% success</span>
+</div>
+
+<h3>Key Pool</h3>
+<table>
+  <thead>
+    <tr>
+      <th>Key</th><th>Usage</th><th>Success</th>
+      <th>Fail</th><th>Cooldown</th><th>Status</th>
+    </tr>
+  </thead>
+  <tbody id="pool-body"></tbody>
+</table>
+
+<h3>Live Logs</h3>
+<div id="log-box"></div>
+
+<script>
+(function () {
+  async function refreshPool() {
+    try {
+      const resp = await fetch('/pool-status');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const m = data.metrics;
+      document.getElementById('m-uptime').textContent = m.uptime_human;
+      document.getElementById('m-reqs').textContent   = m.total_requests.toLocaleString();
+      document.getElementById('m-ok').textContent     = m.total_success.toLocaleString();
+      document.getElementById('m-fail').textContent   = m.total_fail.toLocaleString();
+      document.getElementById('m-429').textContent    = m.total_429;
+      document.getElementById('m-rate').textContent   = m.success_rate_pct;
+      const tbody = document.getElementById('pool-body');
+      tbody.innerHTML = data.keys.map(k => {
+        const avail = k.available_in > 0;
+        return '<tr>' +
+          '<td><code>' + k.key_preview + '</code></td>' +
+          '<td>' + k.usage + '</td>' +
+          '<td class="ok">' + k.success + '</td>' +
+          '<td class="fail">' + k.fail + '</td>' +
+          '<td>' + (avail ? k.available_in + 's' : '-') + '</td>' +
+          '<td>' + (avail
+            ? '<span class="pill-red">&#x1F534; cooling</span>'
+            : '<span class="pill-green">&#x1F7E2; active</span>') + '</td>' +
+          '</tr>';
+      }).join('');
+    } catch (e) { /* network error — will retry */ }
+  }
+  refreshPool();
+  setInterval(refreshPool, 3000);
+
+  const logBox = document.getElementById('log-box');
+  const MAX_LINES = 500;
+  function appendLog(text) {
+    const line = document.createElement('div');
+    line.textContent = text;
+    logBox.appendChild(line);
+    while (logBox.childElementCount > MAX_LINES) {
+      logBox.removeChild(logBox.firstChild);
+    }
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+  const es = new EventSource('/logs');
+  es.onmessage = e => appendLog(e.data);
+  es.onerror   = ()  => appendLog('[connection lost — retrying...]');
+})();
+</script>
+</body>
+</html>
+"""
+
+
+async def handle_internal(request: Request, path: str):
+    global POOL
+
+    # Auth guard: localhost always allowed; remote requires Bearer token
+    client_host = request.client.host if request.client else "unknown"
+    is_local = client_host in ("127.0.0.1", "::1", "localhost")
+
+    if not is_local:
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {ADMIN_TOKEN}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # ── Dashboard ──────────────────────────────────────────────────────────
+    if path == "dashboard":
+        return HTMLResponse(_DASHBOARD_HTML)
+
+    # ── Log tail (SSE) ─────────────────────────────────────────────────────
+    if path == "logs":
+        async def tail():
+            with open(LOG_FILE, "r") as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
+                        yield f"data: {line.rstrip()}\n\n"
+                    else:
+                        await asyncio.sleep(0.5)
+        return StreamingResponse(tail(), media_type="text/event-stream")
+
+    # ── /status ────────────────────────────────────────────────────────────
+    if path == "status":
+        available = sum(1 for s in POOL.states if s.is_available())
+        return JSONResponse({
+            "project": PROJECT_NAME,
+            "uptime": METRICS.uptime_str(),
+            "keys": {
+                "total": len(POOL.states),
+                "available": available,
+                "pool": POOL.status(),
+            },
+            "metrics": METRICS.summary(),
+        })
+
+    # ── /pool-status (lightweight JSON for dashboard polling) ──────────────
+    if path == "pool-status":
+        available = sum(1 for s in POOL.states if s.is_available())
+        return JSONResponse({
+            "keys": POOL.status(),
+            "available": available,
+            "total": len(POOL.states),
+            "metrics": METRICS.summary(),
+        })
+
+    # ── /health ────────────────────────────────────────────────────────────
+    if path == "health":
+        available = sum(1 for s in POOL.states if s.is_available())
+        total = len(POOL.states)
+        healthy = available > 0
+        return JSONResponse(
+            {
+                "status": "ok" if healthy else "degraded",
+                "available_keys": available,
+                "total_keys": total,
+                "uptime": METRICS.uptime_str(),
+            },
+            status_code=200 if healthy else 503,
+        )
+
+    # ── /reload-keys ───────────────────────────────────────────────────────
+    if path == "reload-keys":
+        if request.method != "POST":
+            return JSONResponse({"error": "POST required"}, status_code=405)
+        try:
+            new_keys = load_keys_from_file(KEYS_FILE)
+            if not new_keys:
+                return JSONResponse({"error": "keys file is empty"}, status_code=400)
+            POOL = KeyPool(new_keys)
+            log.info(f"Keys reloaded via HTTP: {len(new_keys)} keys")
+            return JSONResponse({"status": "ok", "keys_loaded": len(new_keys)})
+        except FileNotFoundError:
+            return JSONResponse({"error": f"{KEYS_FILE} not found"}, status_code=404)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    return JSONResponse({"error": "not found"}, status_code=404)

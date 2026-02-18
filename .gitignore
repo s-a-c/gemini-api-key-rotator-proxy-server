@@ -3,3 +3,5 @@ __pycache__
 *copy*.py
 api*.txt
 trash
+.env
+!.env.example
